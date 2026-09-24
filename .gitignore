@@ -6,11 +6,14 @@ __pycache__/
 *.py[cod]
 .DS_Store
 .ipynb_checkpoints/
-# Data files (Never commit raw datasets to git!)
-dataset/*.csv
-dataset/*.parquet
-dataset/*.json
-dataset/*.zip
+# Data files (Never commit raw datasets or outputs to git!)
+dataset/
+output/
+*.tsv
+*.csv
+*.parquet
+*.json
+*.zip
 # Media & Heavy Caches
 images/
 data/
