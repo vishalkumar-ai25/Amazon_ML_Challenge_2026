@@ -1,0 +1,29 @@
+# Python & Environments
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+.DS_Store
+.ipynb_checkpoints/
+# Data files (Never commit raw datasets to git!)
+dataset/*.csv
+dataset/*.parquet
+dataset/*.json
+dataset/*.zip
+# Media & Heavy Caches
+images/
+data/
+catboost_info/
+# Model Weights
+*.bin
+*.pt
+*.pth
+*.onnx
+*.joblib
+*.pkl
+*.npy
+*.npz
+# Logs & scratch
+*.log
+scratch/
