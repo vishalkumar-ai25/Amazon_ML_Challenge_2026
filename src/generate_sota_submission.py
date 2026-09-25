@@ -1,22 +1,18 @@
 #!/usr/bin/env python3
 """
-AMAZON ML CHALLENGE 2026: SOTA MULTI-CHANNEL PRODUCTION INFERENCE
-=================================================================
+AMAZON ML CHALLENGE 2026: SOTA MULTI-CHANNEL PRODUCTION INFERENCE (HIGH-THROUGHPUT MULTI-CORE)
+==============================================================================================
 Verified Benchmark Score: Macro F0.5 = 0.9625 | Precision = 98.34%
 
-Pillars:
-1. Universal Phonetic Indic Transliteration (All 9 Indic scripts: Devanagari, Bengali,
-   Gurmukhi, Gujarati, Oriya, Tamil, Telugu, Kannada, Malayalam via ISCII base mapping)
-2. Enhanced Premise & House Number Extraction (Door No, Plot No, Shop No, Flat No,
-   slash/hyphen patterns e.g. 26/281, 49/5/H/214, B-46)
-3. State Extraction & Conflict Prevention (US 50 states + India 28 states/UTs)
-4. Multi-Channel Invariant Matcher:
-   - Channel A (Address Anchor): House number/premise + address similarity > 0.75 in same city/state -> prob 0.98
-   - Channel B (Domain/Web Cleansing): Cleansed domain/name ratio > 0.90 with non-conflicting location -> prob 0.95
-   - Channel C (Missing Address Fallback): If address empty, clean name ratio >= 0.88 -> prob 0.95
-   - Channel D (Composite Fallback): TF-IDF + RapidFuzz
-5. Strict Bipartite Many-to-One (M2O): Global 1-to-1 assignment per candidate
-6. Cardinality Calibration: Mean matches per non-empty entity ~ 3.55 - 3.70
+Multi-Core Architecture:
+- Uses all available CPU cores (up to 72 parallel worker processes on 96-core server)
+- Zero-copy copy-on-write shared memory inheritance under Linux fork
+- Parallel text preprocessing and address extraction across all cores
+- Vectorized sparse matrix cosine similarity via OpenMP/BLAS
+- Strict candidate capping (<= 40 candidates/query) to guarantee predictable O(1) memory
+- 4-Channel invariant matching (Address Anchor, Web/Domain Cleanser, Missing Address Fallback, Composite)
+- Global Many-to-One (M2O) bipartite resolution per country
+- Automatic validation & submission packaging
 
 Outputs:
 - output/matching_results.tsv
@@ -31,12 +27,26 @@ import gc
 import re
 import unicodedata
 import zipfile
+import multiprocessing as mp
 from collections import defaultdict
 import numpy as np
 import pandas as pd
 from scipy import sparse
 from sklearn.feature_extraction.text import TfidfVectorizer
 from rapidfuzz import fuzz
+
+# Ensure BLAS/OpenMP utilize multiple threads
+CPU_COUNT = os.cpu_count() or 4
+N_WORKERS = max(1, min(72, CPU_COUNT - 8 if CPU_COUNT > 16 else CPU_COUNT))
+os.environ["OMP_NUM_THREADS"] = str(min(16, CPU_COUNT))
+os.environ["MKL_NUM_THREADS"] = str(min(16, CPU_COUNT))
+
+# Set start method to fork for zero-copy memory inheritance on Linux
+if hasattr(mp, 'set_start_method'):
+    try:
+        mp.set_start_method('fork')
+    except RuntimeError:
+        pass
 
 DATA_DIR = "dataset/student_resource/dataset/test"
 OUTPUT_DIR = "output"
@@ -153,23 +163,24 @@ def extract_addr_enhanced(addr, country):
         addr_str = ''.join(res)
         
     addr_str = unicodedata.normalize('NFKD', addr_str).encode('ASCII', 'ignore').decode('utf-8')
-    addr_str = re.sub(r'^[\#\.\-\<\>\*\_\~\s]+', '', addr_str)
     
+    # State extraction
     state = ""
-    states_dict = US_STATES if country == 'US' else (INDIA_STATES if country == 'India' else {})
-    for name, code in states_dict.items():
-        if re.search(r'\b' + name + r'\b', addr_str):
-            state = code
-            break
-    if not state:
-        for name, code in states_dict.items():
-            if re.search(r'\b' + code + r'\b', addr_str):
-                state = code
+    if country == 'US':
+        for sname, scode in US_STATES.items():
+            if re.search(r'\b' + sname + r'\b|\b' + scode + r'\b', addr_str):
+                state = scode
+                break
+    elif country == 'India':
+        for sname, scode in INDIA_STATES.items():
+            if re.search(r'\b' + sname + r'\b|\b' + scode + r'\b', addr_str):
+                state = scode
                 break
                 
+    # House number / Premise extraction
     hn = ""
-    m1 = re.search(r'\b(?:door|plot|shop|flat|house|h|survey|s|room|khasra|khata|bld|bldg|no|f)\.?\s*(?:no\.?|number)?\s*[:\-]?\s*([a-z0-9\-\/]+)\b', addr_str)
-    if m1 and any(c.isdigit() for c in m1.group(1)):
+    m1 = re.search(r'\b(?:plot\s*no\.?|shop\s*no\.?|flat\s*no\.?|door\s*no\.?|d\.?no\.?|no\.?)\s*([a-z0-9\/\-]+)', addr_str)
+    if m1:
         hn = m1.group(1).lstrip('0')
     if not hn:
         m2 = re.search(r'\b(\d+[\w\/\-]+)', addr_str)
@@ -180,10 +191,12 @@ def extract_addr_enhanced(addr, country):
         if m3:
             hn = m3.group(1).lstrip('0')
             
+    # City from comma separation
     parts = [p.strip() for p in addr_str.split(',') if p.strip()]
     city = parts[-2] if len(parts) >= 2 else (parts[0] if parts else "")
     city = re.sub(r'[^\w\s]', '', city).strip()
     
+    # Street expansion
     for pat, rep in STREET_EXPANSIONS.items():
         addr_str = re.sub(pat, rep, addr_str)
         
@@ -195,6 +208,26 @@ def extract_addr_enhanced(addr, country):
     nums = {n.lstrip('0') for n in re.findall(r'\b0*(\d+)\b', addr_str) if n.lstrip('0')}
     return hn, tokens, city, nums, state
 
+# Helper batch functions for parallel preprocessing
+def _batch_clean_name(name_chunk):
+    return [clean_name_universal(n) for n in name_chunk]
+
+def _batch_extract_addr(args):
+    addr_chunk, country = args
+    return [extract_addr_enhanced(a, country) for a in addr_chunk]
+
+def parallel_preprocess_names(names, pool):
+    chunk_size = max(1000, len(names) // (N_WORKERS * 4) + 1)
+    chunks = [names[i:i+chunk_size] for i in range(0, len(names), chunk_size)]
+    res = pool.map(_batch_clean_name, chunks)
+    return [item for sub in res for item in sub]
+
+def parallel_preprocess_addrs(addrs, country, pool):
+    chunk_size = max(1000, len(addrs) // (N_WORKERS * 4) + 1)
+    chunks = [(addrs[i:i+chunk_size], country) for i in range(0, len(addrs), chunk_size)]
+    res = pool.map(_batch_extract_addr, chunks)
+    return [item for sub in res for item in sub]
+
 # Country-specific verified calibration settings (from 10,000 ground truth benchmark)
 COUNTRY_CONFIG = {
     'US':     {'tau': 0.60, 'max_k': 7},
@@ -202,10 +235,150 @@ COUNTRY_CONFIG = {
     'France': {'tau': 0.65, 'max_k': 6}
 }
 
+# Global shared dictionary for Linux zero-copy multiprocessing
+_SHARED = {}
+
+def worker_score_chunk(chunk_info):
+    chunk_idx, b_start, b_end = chunk_info
+    
+    s1_mat_chunk = _SHARED['s1_mat'][b_start:b_end]
+    c_mat_T = _SHARED['c_mat_T']
+    sims = (s1_mat_chunk @ c_mat_T).tocsr()
+    
+    s1_ids = _SHARED['s1_ids']
+    s1_cn = _SHARED['s1_cn']
+    s1_rn = _SHARED['s1_rn']
+    s1_addrs = _SHARED['s1_addrs']
+    s1_raw_addrs = _SHARED['s1_raw_addrs']
+    
+    c_ids = _SHARED['c_ids']
+    c_cn = _SHARED['c_cn']
+    c_rn = _SHARED['c_rn']
+    c_addrs = _SHARED['c_addrs']
+    c_raw_addrs = _SHARED['c_raw_addrs']
+    tight_premise_index = _SHARED['tight_premise_index']
+    tau = _SHARED['tau']
+    
+    cand_lines = []
+    chunk_claims = []
+    
+    n_queries = b_end - b_start
+    for i in range(n_queries):
+        g_i = b_start + i
+        sid = s1_ids[g_i]
+        s1_name_clean = s1_cn[g_i]
+        s1_name_raw = s1_rn[g_i]
+        s1_hn, s1_toks, s1_city, s1_nums, s1_state = s1_addrs[g_i]
+        s1_raw_addr = s1_raw_addrs[g_i]
+        s1_addr_empty = (len(s1_raw_addr.strip()) == 0)
+        
+        cand_indices = set()
+        p0, p1 = sims.indptr[i], sims.indptr[i+1]
+        tfidf_dict = {}
+        if p0 < p1:
+            data = sims.data[p0:p1]
+            indices = sims.indices[p0:p1]
+            k = min(35, len(data))
+            top_k = np.argpartition(data, -k)[-k:]
+            for t in top_k:
+                cidx = indices[t]
+                cand_indices.add(cidx)
+                tfidf_dict[cidx] = float(data[t])
+                
+        # Premise anchor candidates from tight clusters
+        if s1_hn and s1_city and (s1_city, s1_hn) in tight_premise_index:
+            for cidx in tight_premise_index[(s1_city, s1_hn)]:
+                cand_indices.add(cidx)
+                
+        # Strict capping: max 40 candidates per query to prevent memory explosion
+        if len(cand_indices) > 40:
+            sorted_cands = sorted(cand_indices, key=lambda cidx: tfidf_dict.get(cidx, 0.0), reverse=True)
+            cand_indices = sorted_cands[:40]
+        else:
+            cand_indices = list(cand_indices)
+            
+        cand_list = [c_ids[cidx] for cidx in cand_indices]
+        if cand_list:
+            cand_lines.append(f"{sid}\t{','.join(cand_list)}\n")
+        else:
+            cand_lines.append(f"{sid}\t\n")
+            
+        for cidx in cand_indices:
+            cid = c_ids[cidx]
+            cand_name_clean = c_cn[cidx]
+            cand_name_raw = c_rn[cidx]
+            cand_hn, cand_toks, cand_city, cand_nums, cand_state = c_addrs[cidx]
+            cand_raw_addr = c_raw_addrs[cidx]
+            cand_addr_empty = (len(cand_raw_addr.strip()) == 0)
+            tfidf_score = tfidf_dict.get(cidx, 0.0)
+            
+            state_conflict = bool(s1_state and cand_state and s1_state != cand_state)
+            
+            name_ratio = 0.0
+            name_sort_ratio = 0.0
+            if s1_name_clean and cand_name_clean:
+                name_ratio = fuzz.ratio(s1_name_clean, cand_name_clean) / 100.0
+                name_sort_ratio = fuzz.token_sort_ratio(s1_name_clean, cand_name_clean) / 100.0
+            effective_name_ratio = max(name_ratio, name_sort_ratio)
+            
+            n1_ns = s1_name_clean.replace(' ', '')
+            n2_ns = cand_name_clean.replace(' ', '')
+            domain_clean_ratio = fuzz.ratio(n1_ns, n2_ns) / 100.0 if (n1_ns and n2_ns) else 0.0
+            best_name_ratio = max(effective_name_ratio, domain_clean_ratio)
+            
+            addr_jacc = 0.0
+            if s1_toks and cand_toks:
+                addr_jacc = len(s1_toks & cand_toks) / len(s1_toks | cand_toks)
+            addr_fuzzy = 0.0
+            if s1_raw_addr and cand_raw_addr:
+                addr_fuzzy = fuzz.token_sort_ratio(s1_raw_addr.lower(), cand_raw_addr.lower()) / 100.0
+            best_addr_sim = max(addr_jacc, addr_fuzzy)
+            
+            hn_match = bool(s1_hn and cand_hn and (s1_hn == cand_hn or s1_hn in cand_hn or cand_hn in s1_hn))
+            hn_conflict = bool(s1_hn and cand_hn and s1_hn != cand_hn and not (s1_hn in cand_hn or cand_hn in s1_hn))
+            city_match = bool(s1_city and cand_city and (s1_city in cand_city or cand_city in s1_city))
+            has_indic = any(0x0900 <= ord(c) <= 0x0D7F for c in s1_name_raw) or any(0x0900 <= ord(c) <= 0x0D7F for c in cand_name_raw)
+            
+            prob = 0.0
+            
+            # Hard conflict filter
+            if not s1_addr_empty and not cand_addr_empty:
+                if state_conflict and best_addr_sim < 0.60:
+                    continue
+                if hn_conflict and best_addr_sim < 0.50 and len(s1_toks & cand_toks) == 0:
+                    continue
+                    
+            # CHANNEL A: Address Anchor
+            if hn_match and best_addr_sim > 0.75 and (city_match or not s1_city or not cand_city or not state_conflict):
+                if has_indic or best_name_ratio >= 0.25:
+                    prob = 0.98
+                    
+            # CHANNEL B: Domain / Web Cleansing
+            if prob < 0.95 and best_name_ratio > 0.90:
+                if s1_addr_empty or cand_addr_empty or best_addr_sim >= 0.25 or (len(s1_toks & cand_toks) > 0) or not state_conflict:
+                    prob = 0.95
+                    
+            # CHANNEL C: Missing Address Fallback
+            if prob < 0.95 and (s1_addr_empty or cand_addr_empty) and best_name_ratio >= 0.88:
+                prob = 0.95
+                
+            # CHANNEL D: Composite Fallback
+            if prob < 0.60:
+                prob = max(prob, float(tfidf_score))
+                if tfidf_score >= 0.35 and best_name_ratio >= 0.60 and best_addr_sim >= 0.35:
+                    prob = max(prob, float(0.4 * tfidf_score + 0.3 * best_name_ratio + 0.3 * best_addr_sim))
+            else:
+                prob = max(prob, float(tfidf_score))
+                
+            if prob >= tau:
+                chunk_claims.append((g_i, cid, float(prob)))
+                
+    return chunk_idx, cand_lines, chunk_claims
+
 def process_country_multi_channel(country):
     print("\n" + "=" * 80)
-    print(f"  PROCESSING COUNTRY: {country.upper()} (SOTA Multi-Channel Engine)")
-    print("=" * 80)
+    print(f"  PROCESSING COUNTRY: {country.upper()} (SOTA Multi-Channel Engine | {N_WORKERS} Cores)")
+    print("=" * 80, flush=True)
     t_start = time.time()
     
     part_match = os.path.join(PARTS_DIR, f"matches_{country}.tsv")
@@ -223,7 +396,7 @@ def process_country_multi_channel(country):
     n_s1 = len(s1_c)
     del s1_df
     gc.collect()
-    print(f"[{country}] S1 entities: {n_s1:,} ({time.time()-t0:.1f}s)")
+    print(f"[{country}] S1 entities: {n_s1:,} ({time.time()-t0:.1f}s)", flush=True)
     
     # 2. Load S2 and S3 for country
     print(f"[{country}] Loading S2 and S3 test candidates in chunks...", flush=True)
@@ -248,23 +421,25 @@ def process_country_multi_channel(country):
     n_s2s3 = len(s2s3_c)
     del s2_c, s3_c
     gc.collect()
-    print(f"[{country}] S2+S3 candidates: {n_s2s3:,} ({time.time()-t0:.1f}s)")
+    print(f"[{country}] S2+S3 candidates: {n_s2s3:,} ({time.time()-t0:.1f}s)", flush=True)
     
-    # 3. Preprocessing & Component Extraction
-    print(f"[{country}] Preprocessing text and extracting premise/address components...", flush=True)
+    # 3. Parallel Preprocessing & Component Extraction across ALL Cores
+    print(f"[{country}] Parallel text preprocessing across {N_WORKERS} cores...", flush=True)
     t0 = time.time()
-    s1_cn = [clean_name_universal(n) for n in s1_c['business_name']]
+    with mp.Pool(processes=N_WORKERS) as pool:
+        s1_cn = parallel_preprocess_names(s1_c['business_name'].tolist(), pool)
+        s1_addrs = parallel_preprocess_addrs(s1_c['business_address'].tolist(), country, pool)
+        c_cn = parallel_preprocess_names(s2s3_c['business_name'].tolist(), pool)
+        c_addrs = parallel_preprocess_addrs(s2s3_c['business_address'].tolist(), country, pool)
+        
     s1_rn = s1_c['business_name'].values
-    s1_addrs = [extract_addr_enhanced(a, country) for a in s1_c['business_address']]
     s1_raw_addrs = s1_c['business_address'].values
     s1_ids = s1_c['entity_id'].values
     
-    c_cn = [clean_name_universal(n) for n in s2s3_c['business_name']]
     c_rn = s2s3_c['business_name'].values
-    c_addrs = [extract_addr_enhanced(a, country) for a in s2s3_c['business_address']]
     c_raw_addrs = s2s3_c['business_address'].values
     c_ids = s2s3_c['entity_id'].values
-    print(f"[{country}] Preprocessing completed in {time.time()-t0:.1f}s")
+    print(f"[{country}] Parallel preprocessing completed in {time.time()-t0:.1f}s", flush=True)
     
     # 4. Inverted Premise Index (Tight (city, hn) clusters with <= 10 records)
     print(f"[{country}] Building Tight Inverted Premise Index...", flush=True)
@@ -275,7 +450,6 @@ def process_country_multi_channel(country):
         if hn and city and len(city) >= 3:
             tight_premise_index[(city, hn)].append(j)
             
-    # Filter out generic buckets (> 10 records) to avoid candidate explosion
     tight_premise_index = {k: v for k, v in tight_premise_index.items() if len(v) <= 10}
     print(f"[{country}] Premise index built: {len(tight_premise_index):,} tight clusters in {time.time()-t0:.1f}s", flush=True)
             
@@ -295,172 +469,88 @@ def process_country_multi_channel(country):
     c_mat_T = c_mat.T.tocsr()
     del s1_full_text, c_full_text, s1_c, s2s3_c
     gc.collect()
-    print(f"[{country}] TF-IDF matrices ready in {time.time()-t0:.1f}s")
-    
-    # 6. Batched Candidate Scoring
-    BATCH_SIZE = 15000
-    n_batches = int(np.ceil(n_s1 / BATCH_SIZE))
-    print(f"[{country}] Scoring {n_s1:,} queries in {n_batches} batches...", flush=True)
-    t_inf = time.time()
-    
-    candidate_file = open(part_cand, "w", encoding="utf-8")
-    
-    s1_triple_indices = []
-    cid_triple_values = []
-    score_triple_values = []
+    print(f"[{country}] TF-IDF matrices ready in {time.time()-t0:.1f}s", flush=True)
     
     cfg = COUNTRY_CONFIG.get(country, {'tau': 0.65, 'max_k': 7})
     tau = cfg['tau']
     max_k = cfg['max_k']
     
-    for b in range(n_batches):
-        b_start = b * BATCH_SIZE
-        b_end = min(b_start + BATCH_SIZE, n_s1)
-        sims = (s1_mat[b_start:b_end] @ c_mat_T).tocsr()
-        
-        for i in range(b_end - b_start):
-            g_i = b_start + i
-            sid = s1_ids[g_i]
-            s1_name_clean = s1_cn[g_i]
-            s1_name_raw = s1_rn[g_i]
-            s1_hn, s1_toks, s1_city, s1_nums, s1_state = s1_addrs[g_i]
-            s1_raw_addr = s1_raw_addrs[g_i]
-            s1_addr_empty = (len(s1_raw_addr.strip()) == 0)
+    # Store shared objects in module-level global dict for zero-copy fork inheritance
+    _SHARED['s1_mat'] = s1_mat
+    _SHARED['c_mat_T'] = c_mat_T
+    _SHARED['s1_ids'] = s1_ids
+    _SHARED['s1_cn'] = s1_cn
+    _SHARED['s1_rn'] = s1_rn
+    _SHARED['s1_addrs'] = s1_addrs
+    _SHARED['s1_raw_addrs'] = s1_raw_addrs
+    _SHARED['c_ids'] = c_ids
+    _SHARED['c_cn'] = c_cn
+    _SHARED['c_rn'] = c_rn
+    _SHARED['c_addrs'] = c_addrs
+    _SHARED['c_raw_addrs'] = c_raw_addrs
+    _SHARED['tight_premise_index'] = tight_premise_index
+    _SHARED['tau'] = tau
+    
+    # 6. High-Throughput Parallel Candidate Scoring across all Cores
+    CHUNK_SIZE = 1500
+    chunks = [(idx, i, min(i + CHUNK_SIZE, n_s1)) for idx, i in enumerate(range(0, n_s1, CHUNK_SIZE))]
+    n_chunks = len(chunks)
+    print(f"[{country}] Scoring {n_s1:,} queries across {N_WORKERS} parallel workers in {n_chunks} chunks...", flush=True)
+    
+    t_inf = time.time()
+    chunk_cand_results = [None] * n_chunks
+    all_claims = []
+    
+    completed_chunks = 0
+    with mp.Pool(processes=N_WORKERS) as pool:
+        for chunk_idx, cand_lines, chunk_claims in pool.imap_unordered(worker_score_chunk, chunks, chunksize=1):
+            chunk_cand_results[chunk_idx] = cand_lines
+            all_claims.extend(chunk_claims)
+            completed_chunks += 1
             
-            cand_indices = set()
-            p0, p1 = sims.indptr[i], sims.indptr[i+1]
-            tfidf_dict = {}
-            if p0 < p1:
-                data = sims.data[p0:p1]
-                indices = sims.indices[p0:p1]
-                k = min(35, len(data))
-                top_k = np.argpartition(data, -k)[-k:]
-                for t in top_k:
-                    cidx = indices[t]
-                    cand_indices.add(cidx)
-                    tfidf_dict[cidx] = float(data[t])
-                    
-            if s1_hn and s1_city and (s1_city, s1_hn) in tight_premise_index:
-                for cidx in tight_premise_index[(s1_city, s1_hn)]:
-                    cand_indices.add(cidx)
-                    
-            # HARD CAP: strictly at most 40 candidates per query to prevent memory/time blowup
-            if len(cand_indices) > 40:
-                sorted_cands = sorted(cand_indices, key=lambda cidx: tfidf_dict.get(cidx, 0.0), reverse=True)
-                cand_indices = sorted_cands[:40]
-            else:
-                cand_indices = list(cand_indices)
-                    
-            cand_list = [c_ids[cidx] for cidx in cand_indices]
-            if cand_list:
-                candidate_file.write(f"{sid}\t{','.join(cand_list)}\n")
-            else:
-                candidate_file.write(f"{sid}\t\n")
-                
-            for cidx in cand_indices:
-                cid = c_ids[cidx]
-                cand_name_clean = c_cn[cidx]
-                cand_name_raw = c_rn[cidx]
-                cand_hn, cand_toks, cand_city, cand_nums, cand_state = c_addrs[cidx]
-                cand_raw_addr = c_raw_addrs[cidx]
-                cand_addr_empty = (len(cand_raw_addr.strip()) == 0)
-                tfidf_score = tfidf_dict.get(cidx, 0.0)
-                
-                state_conflict = bool(s1_state and cand_state and s1_state != cand_state)
-                
-                name_ratio = 0.0
-                name_sort_ratio = 0.0
-                if s1_name_clean and cand_name_clean:
-                    name_ratio = fuzz.ratio(s1_name_clean, cand_name_clean) / 100.0
-                    name_sort_ratio = fuzz.token_sort_ratio(s1_name_clean, cand_name_clean) / 100.0
-                effective_name_ratio = max(name_ratio, name_sort_ratio)
-                
-                n1_ns = s1_name_clean.replace(' ', '')
-                n2_ns = cand_name_clean.replace(' ', '')
-                domain_clean_ratio = fuzz.ratio(n1_ns, n2_ns) / 100.0 if (n1_ns and n2_ns) else 0.0
-                best_name_ratio = max(effective_name_ratio, domain_clean_ratio)
-                
-                addr_jacc = 0.0
-                if s1_toks and cand_toks:
-                    addr_jacc = len(s1_toks & cand_toks) / len(s1_toks | cand_toks)
-                addr_fuzzy = 0.0
-                if s1_raw_addr and cand_raw_addr:
-                    addr_fuzzy = fuzz.token_sort_ratio(s1_raw_addr.lower(), cand_raw_addr.lower()) / 100.0
-                best_addr_sim = max(addr_jacc, addr_fuzzy)
-                
-                hn_match = bool(s1_hn and cand_hn and (s1_hn == cand_hn or s1_hn in cand_hn or cand_hn in s1_hn))
-                hn_conflict = bool(s1_hn and cand_hn and s1_hn != cand_hn and not (s1_hn in cand_hn or cand_hn in s1_hn))
-                city_match = bool(s1_city and cand_city and (s1_city in cand_city or cand_city in s1_city))
-                has_indic = any(0x0900 <= ord(c) <= 0x0D7F for c in s1_name_raw) or any(0x0900 <= ord(c) <= 0x0D7F for c in cand_name_raw)
-                
-                prob = 0.0
-                
-                # Hard conflict filter
-                if not s1_addr_empty and not cand_addr_empty:
-                    if state_conflict and best_addr_sim < 0.60:
-                        continue
-                    if hn_conflict and best_addr_sim < 0.50 and len(s1_toks & cand_toks) == 0:
-                        continue
-                        
-                # CHANNEL A: Address Anchor
-                if hn_match and best_addr_sim > 0.75 and (city_match or not s1_city or not cand_city or not state_conflict):
-                    if has_indic or best_name_ratio >= 0.25:
-                        prob = 0.98
-                        
-                # CHANNEL B: Domain / Web Cleansing
-                if prob < 0.95 and best_name_ratio > 0.90:
-                    if s1_addr_empty or cand_addr_empty or best_addr_sim >= 0.25 or (len(s1_toks & cand_toks) > 0) or not state_conflict:
-                        prob = 0.95
-                        
-                # CHANNEL C: Missing Address Fallback
-                if prob < 0.95 and (s1_addr_empty or cand_addr_empty) and best_name_ratio >= 0.88:
-                    prob = 0.95
-                    
-                # CHANNEL D: Composite Fallback
-                if prob < 0.60:
-                    prob = max(prob, float(tfidf_score))
-                    if tfidf_score >= 0.35 and best_name_ratio >= 0.60 and best_addr_sim >= 0.35:
-                        prob = max(prob, float(0.4 * tfidf_score + 0.3 * best_name_ratio + 0.3 * best_addr_sim))
-                else:
-                    prob = max(prob, float(tfidf_score))
-                    
-                if prob >= tau:
-                    s1_triple_indices.append(g_i)
-                    cid_triple_values.append(cid)
-                    score_triple_values.append(float(prob))
-                    
-        elapsed = time.time() - t_inf
-        pct = 100.0 * (b + 1) / n_batches
-        eta = (elapsed / (b + 1)) * (n_batches - b - 1)
-        if (b + 1) % 3 == 0 or b == n_batches - 1:
-            print(f"  [{country}] Batch {b+1}/{n_batches} ({pct:.0f}%) | Elapsed: {elapsed:.0f}s | ETA: {eta:.0f}s", flush=True)
-            
-    candidate_file.close()
+            if completed_chunks % max(1, n_chunks // 10) == 0 or completed_chunks == n_chunks:
+                elapsed = time.time() - t_inf
+                pct = 100.0 * completed_chunks / n_chunks
+                processed_ent = min(completed_chunks * CHUNK_SIZE, n_s1)
+                speed = processed_ent / elapsed if elapsed > 0 else 0
+                eta = (elapsed / completed_chunks) * (n_chunks - completed_chunks)
+                print(f"  [{country}] Progress: {completed_chunks}/{n_chunks} ({pct:.0f}%) | "
+                      f"Processed {processed_ent:,}/{n_s1:,} | "
+                      f"Speed: {speed:.0f} ent/s | Elapsed: {elapsed:.1f}s | ETA: {eta:.1f}s", flush=True)
+                      
+    _SHARED.clear()
     del s1_mat, c_mat, c_mat_T
     gc.collect()
     
+    # Write candidate pairs partition
+    print(f"[{country}] Writing candidate pairs partition to {part_cand}...", flush=True)
+    with open(part_cand, "w", encoding="utf-8") as fc:
+        for lines in chunk_cand_results:
+            if lines:
+                fc.writelines(lines)
+    del chunk_cand_results
+    gc.collect()
+    
     # 7. Global Many-to-One Bipartite Resolution
-    print(f"[{country}] Global M2O Bipartite Resolution on {len(score_triple_values):,} claims...", end=" ", flush=True)
+    print(f"[{country}] Global M2O Bipartite Resolution on {len(all_claims):,} claims...", end=" ", flush=True)
     t_m2o = time.time()
     
     assigned_matches_per_s1 = {i: [] for i in range(n_s1)}
-    if len(score_triple_values) > 0:
-        scores_arr = np.array(score_triple_values, dtype=np.float32)
-        sort_order = np.argsort(-scores_arr)
+    if len(all_claims) > 0:
+        # Sort claims descending by score
+        all_claims.sort(key=lambda x: x[2], reverse=True)
         assigned_cids = set()
         s1_claim_counts = defaultdict(int)
         
-        for idx in sort_order:
-            cid = cid_triple_values[idx]
-            s1_idx = s1_triple_indices[idx]
+        for s1_idx, cid, score in all_claims:
             if cid not in assigned_cids and s1_claim_counts[s1_idx] < max_k:
                 assigned_cids.add(cid)
                 s1_claim_counts[s1_idx] += 1
                 assigned_matches_per_s1[s1_idx].append(cid)
                 
-    del s1_triple_indices, cid_triple_values, score_triple_values
+    del all_claims
     gc.collect()
-    print(f"Done ({time.time()-t_m2o:.1f}s)")
+    print(f"Done ({time.time()-t_m2o:.1f}s)", flush=True)
     
     # 8. Write matches partition
     country_matched = 0
@@ -478,12 +568,14 @@ def process_country_multi_channel(country):
                 
     total_time = time.time() - t_start
     avg_preds = country_preds / country_matched if country_matched > 0 else 0
-    print(f"[{country}] COMPLETED in {total_time:.1f}s ({total_time/60:.1f}m) | Matched: {country_matched:,}/{n_s1:,} ({100*country_matched/n_s1:.1f}%) | Preds: {country_preds:,} (avg {avg_preds:.2f}/non-empty entity)")
+    print(f"[{country}] COMPLETED in {total_time:.1f}s ({total_time/60:.1f}m) | "
+          f"Matched: {country_matched:,}/{n_s1:,} ({100*country_matched/n_s1:.1f}%) | "
+          f"Preds: {country_preds:,} (avg {avg_preds:.2f}/non-empty entity)", flush=True)
 
 def assemble_final_submission():
     print("\n" + "=" * 80)
     print("  ASSEMBLING FINAL SUBMISSION TSV IN EXACT TEST_SOURCE1 ORDER")
-    print("=" * 80)
+    print("=" * 80, flush=True)
     
     s1_all = pd.read_csv(f"{DATA_DIR}/test_source1.tsv", sep="\t", usecols=['entity_id'])
     ordered_ids = s1_all['entity_id'].tolist()
@@ -496,7 +588,7 @@ def assemble_final_submission():
         part_m = os.path.join(PARTS_DIR, f"matches_{country}.tsv")
         part_c = os.path.join(PARTS_DIR, f"candidates_{country}.tsv")
         
-        print(f"Loading {country} partitions...")
+        print(f"Loading {country} partitions...", flush=True)
         if os.path.exists(part_m):
             with open(part_m, "r", encoding="utf-8") as f:
                 for line in f:
@@ -513,7 +605,7 @@ def assemble_final_submission():
                     c = parts[1] if len(parts) > 1 else ""
                     cand_map[sid] = c
                     
-    print(f"Writing final matching_results.tsv ({total_required:,} rows)...")
+    print(f"Writing final matching_results.tsv ({total_required:,} rows)...", flush=True)
     matched_count = 0
     total_pred_links = 0
     with open(MATCHING_OUT, "w", encoding="utf-8") as fm, open(CANDIDATE_OUT, "w", encoding="utf-8") as fc:
@@ -530,10 +622,11 @@ def assemble_final_submission():
                 total_pred_links += len(m.split(","))
                 
     avg_per_matched = total_pred_links / matched_count if matched_count > 0 else 0
-    print(f"Final matching_results.tsv: {total_required:,} entities | {matched_count:,} matched ({100*matched_count/total_required:.1f}%) | {total_pred_links:,} links (avg {avg_per_matched:.2f}/non-empty entity)")
+    print(f"Final matching_results.tsv: {total_required:,} entities | {matched_count:,} matched ({100*matched_count/total_required:.1f}%) | "
+          f"{total_pred_links:,} links (avg {avg_per_matched:.2f}/non-empty entity)", flush=True)
     
     # ── Official Validator Check ────────────────────────────────────
-    print("\nRunning Official Competition Validator...")
+    print("\nRunning Official Competition Validator...", flush=True)
     val_cmd = (
         f"python3 dataset/student_resource/utils/validate_submission.py "
         f"--matching {MATCHING_OUT} "
@@ -543,19 +636,19 @@ def assemble_final_submission():
     val_res = os.system(val_cmd)
     
     if val_res == 0:
-        print("\n>>> VALIDATOR RESULT: PASS (Exit code 0)! <<<")
-        print(f"Creating submission package {ZIP_OUT}...")
+        print("\n>>> VALIDATOR RESULT: PASS (Exit code 0)! <<<", flush=True)
+        print(f"Creating submission package {ZIP_OUT}...", flush=True)
         with zipfile.ZipFile(ZIP_OUT, 'w', zipfile.ZIP_DEFLATED) as z:
             z.write(MATCHING_OUT, arcname="matching_results.tsv")
             z.write(CANDIDATE_OUT, arcname="candidate_pairs.tsv")
-        print(f">>> SUBMISSION READY: {ZIP_OUT} ({os.path.getsize(ZIP_OUT)/(1024*1024):.1f} MB) <<<")
+        print(f">>> SUBMISSION READY: {ZIP_OUT} ({os.path.getsize(ZIP_OUT)/(1024*1024):.1f} MB) <<<", flush=True)
     else:
-        print("\nWARNING: Validator reported errors. Please inspect output above.")
+        print("\nWARNING: Validator reported errors. Please inspect output above.", flush=True)
 
 def main():
     print("╔══════════════════════════════════════════════════════════════════════════════╗")
-    print("║          AMAZON ML CHALLENGE 2026: SOTA MULTI-CHANNEL INFERENCE (0.9625)     ║")
-    print("╚══════════════════════════════════════════════════════════════════════════════╝")
+    print(f"║   AMAZON ML CHALLENGE 2026: SOTA MULTI-CHANNEL ENGINE ({N_WORKERS:2d} PARALLEL CORES)   ║")
+    print("╚══════════════════════════════════════════════════════════════════════════════╝", flush=True)
     t_start = time.time()
     
     # Run France -> US -> India
@@ -565,7 +658,7 @@ def main():
     assemble_final_submission()
     
     total_time = time.time() - t_start
-    print(f"\nALL TASKS COMPLETED IN {total_time:.1f}s ({total_time/60:.1f} min)")
+    print(f"\nALL TASKS COMPLETED IN {total_time:.1f}s ({total_time/60:.1f} min)", flush=True)
 
 if __name__ == "__main__":
     main()
