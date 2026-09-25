@@ -33,7 +33,7 @@ from collections import Counter
 from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
 from sklearn.model_selection import StratifiedKFold
 from scipy import sparse
-from difflib import SequenceMatcher
+import rapidfuzz
 
 # ── Optional imports ────────────────────────────────────────────
 try:
@@ -188,7 +188,7 @@ def compute_pairwise_features(s1_name, s1_addr, s2_name, s2_addr, tfidf_score):
     features['name_exact'] = 1.0 if name1 == name2 and name1 != '' else 0.0
     
     # 2. Name SequenceMatcher ratio (character-level edit distance)
-    features['name_seqmatch'] = SequenceMatcher(None, name1, name2).ratio() if name1 and name2 else 0.0
+    features['name_seqmatch'] = rapidfuzz.fuzz.ratio(name1, name2) / 100.0 if name1 and name2 else 0.0
     
     # 3. Name Jaccard (word-level)
     w1 = get_word_set(name1)
@@ -239,7 +239,7 @@ def compute_pairwise_features(s1_name, s1_addr, s2_name, s2_addr, tfidf_score):
         features['addr_jaccard'] = 0.0
     
     # 11. Address SequenceMatcher ratio
-    features['addr_seqmatch'] = SequenceMatcher(None, addr1, addr2).ratio() if addr1 and addr2 else 0.0
+    features['addr_seqmatch'] = rapidfuzz.fuzz.ratio(addr1, addr2) / 100.0 if addr1 and addr2 else 0.0
     
     # 12. Postal code match / mismatch / missing
     pc1 = extract_postal_code(s1_addr)
@@ -418,97 +418,108 @@ def build_training_pairs(sample_size=SAMPLE_SIZE_PER_COUNTRY):
         print(f"  Extracting features from blocking candidates ({n_batches} batches)...")
         t_feat = time.time()
         
-        for b in range(n_batches):
-            b_start = b * BATCH_SIZE
-            b_end = min(b_start + BATCH_SIZE, n_s1)
-            
-            # Channel A
-            b_sims_a = s1_mat_a[b_start:b_end] @ s2s3_mat_a_T
-            if not isinstance(b_sims_a, sparse.csr_matrix):
-                b_sims_a = b_sims_a.tocsr()
-            
-            # Channel B
-            b_inter_b = A[b_start:b_end] @ B_T
-            if not isinstance(b_inter_b, sparse.csr_matrix):
-                b_inter_b = b_inter_b.tocsr()
-            
-            for i in range(b_end - b_start):
-                global_i = b_start + i
-                sid = s1_ids[global_i]
-                gt_set = gt_map.get(sid, set())
+        import multiprocessing
+        num_cores = max(1, os.cpu_count() - 2)
+        with multiprocessing.Pool(num_cores) as pool:
+            for b in range(n_batches):
+                b_start = b * BATCH_SIZE
+                b_end = min(b_start + BATCH_SIZE, n_s1)
                 
-                # Channel A top-K
-                p0_a, p1_a = b_sims_a.indptr[i], b_sims_a.indptr[i+1]
-                top_a = {}
-                if p0_a < p1_a:
-                    data_a = b_sims_a.data[p0_a:p1_a]
-                    indices_a = b_sims_a.indices[p0_a:p1_a]
-                    k_a = min(TOP_K_CHANNEL_A, len(data_a))
-                    if len(data_a) > TOP_K_CHANNEL_A:
-                        top_idx_a = np.argpartition(data_a, -k_a)[-k_a:]
-                    else:
-                        top_idx_a = np.arange(len(data_a))
-                    for idx in top_idx_a:
-                        cid = s2s3_ids[indices_a[idx]]
-                        top_a[cid] = float(data_a[idx])
+                # Channel A
+                b_sims_a = s1_mat_a[b_start:b_end] @ s2s3_mat_a_T
+                if not isinstance(b_sims_a, sparse.csr_matrix):
+                    b_sims_a = b_sims_a.tocsr()
                 
-                # Channel B top-K  
-                p0_b, p1_b = b_inter_b.indptr[i], b_inter_b.indptr[i+1]
-                top_b = {}
-                if p0_b < p1_b and len_A[global_i] > 0:
-                    inter_data = b_inter_b.data[p0_b:p1_b]
-                    inter_indices = b_inter_b.indices[p0_b:p1_b]
-                    denoms = len_A[global_i] + len_B[inter_indices] - inter_data
-                    jaccard_scores = inter_data / denoms
-                    k_b = min(TOP_K_CHANNEL_B, len(jaccard_scores))
-                    if len(jaccard_scores) > TOP_K_CHANNEL_B:
-                        top_idx_b = np.argpartition(jaccard_scores, -k_b)[-k_b:]
-                    else:
-                        top_idx_b = np.arange(len(jaccard_scores))
-                    for idx in top_idx_b:
-                        cid = s2s3_ids[inter_indices[idx]]
-                        top_b[cid] = float(jaccard_scores[idx])
+                # Channel B
+                b_inter_b = A[b_start:b_end] @ B_T
+                if not isinstance(b_inter_b, sparse.csr_matrix):
+                    b_inter_b = b_inter_b.tocsr()
                 
-                # Union
-                union_cands = {}
-                for cid, s in top_a.items():
-                    union_cands[cid] = s
-                for cid, s in top_b.items():
-                    if cid in union_cands:
-                        union_cands[cid] = max(union_cands[cid], s)
-                    else:
+                batch_args = []
+                batch_meta = []
+                
+                for i in range(b_end - b_start):
+                    global_i = b_start + i
+                    sid = s1_ids[global_i]
+                    gt_set = gt_map.get(sid, set())
+                    
+                    # Channel A top-K
+                    p0_a, p1_a = b_sims_a.indptr[i], b_sims_a.indptr[i+1]
+                    top_a = {}
+                    if p0_a < p1_a:
+                        data_a = b_sims_a.data[p0_a:p1_a]
+                        indices_a = b_sims_a.indices[p0_a:p1_a]
+                        k_a = min(TOP_K_CHANNEL_A, len(data_a))
+                        if len(data_a) > TOP_K_CHANNEL_A:
+                            top_idx_a = np.argpartition(data_a, -k_a)[-k_a:]
+                        else:
+                            top_idx_a = np.arange(len(data_a))
+                        for idx in top_idx_a:
+                            cid = s2s3_ids[indices_a[idx]]
+                            top_a[cid] = float(data_a[idx])
+                    
+                    # Channel B top-K  
+                    p0_b, p1_b = b_inter_b.indptr[i], b_inter_b.indptr[i+1]
+                    top_b = {}
+                    if p0_b < p1_b and len_A[global_i] > 0:
+                        inter_data = b_inter_b.data[p0_b:p1_b]
+                        inter_indices = b_inter_b.indices[p0_b:p1_b]
+                        denoms = len_A[global_i] + len_B[inter_indices] - inter_data
+                        jaccard_scores = inter_data / denoms
+                        k_b = min(TOP_K_CHANNEL_B, len(jaccard_scores))
+                        if len(jaccard_scores) > TOP_K_CHANNEL_B:
+                            top_idx_b = np.argpartition(jaccard_scores, -k_b)[-k_b:]
+                        else:
+                            top_idx_b = np.arange(len(jaccard_scores))
+                        for idx in top_idx_b:
+                            cid = s2s3_ids[inter_indices[idx]]
+                            top_b[cid] = float(jaccard_scores[idx])
+                    
+                    # Union
+                    union_cands = {}
+                    for cid, s in top_a.items():
                         union_cands[cid] = s
+                    for cid, s in top_b.items():
+                        if cid in union_cands:
+                            union_cands[cid] = max(union_cands[cid], s)
+                        else:
+                            union_cands[cid] = s
+                    
+                    sorted_union = sorted(union_cands.items(), key=lambda x: -x[1])[:5]
+                    
+                    # Extract features for each candidate
+                    for cid, tfidf_score in sorted_union:
+                        # O(1) lookup for candidate index
+                        cid_idx = s2s3_id_to_idx.get(cid)
+                        if cid_idx is None:
+                            continue
+                        
+                        batch_args.append((
+                            s1_names[global_i], s1_addrs_raw[global_i],
+                            s2s3_names[cid_idx], s2s3_addrs_raw[cid_idx],
+                            tfidf_score
+                        ))
+                        
+                        label = 1 if cid in gt_set else 0
+                        batch_meta.append((sid, cid, country, label))
+                        
+                if batch_args:
+                    feats_list = pool.starmap(compute_pairwise_features, batch_args)
+                    for feats, meta_item in zip(feats_list, batch_meta):
+                        sid, cid, country, label = meta_item
+                        all_features.append([feats[fn] for fn in FEATURE_NAMES])
+                        all_labels.append(label)
+                        all_meta.append((sid, cid, country))
+                        
+                        if label == 1:
+                            country_pos += 1
+                        else:
+                            country_neg += 1
                 
-                sorted_union = sorted(union_cands.items(), key=lambda x: -x[1])[:MAX_UNION_CANDIDATES]
-                
-                # Extract features for each candidate
-                for cid, tfidf_score in sorted_union:
-                    # O(1) lookup for candidate index
-                    cid_idx = s2s3_id_to_idx.get(cid)
-                    if cid_idx is None:
-                        continue
-                    
-                    feats = compute_pairwise_features(
-                        s1_names[global_i], s1_addrs_raw[global_i],
-                        s2s3_names[cid_idx], s2s3_addrs_raw[cid_idx],
-                        tfidf_score
-                    )
-                    
-                    label = 1 if cid in gt_set else 0
-                    
-                    all_features.append([feats[fn] for fn in FEATURE_NAMES])
-                    all_labels.append(label)
-                    all_meta.append((sid, cid, country))
-                    
-                    if label == 1:
-                        country_pos += 1
-                    else:
-                        country_neg += 1
-            
-            if (b + 1) % 5 == 0 or b == n_batches - 1:
-                elapsed = time.time() - t_feat
-                pct = 100.0 * (b + 1) / n_batches
-                print(f"    Batch {b+1}/{n_batches} ({pct:.0f}%) | Pos: {country_pos:,} | Neg: {country_neg:,} | {elapsed:.0f}s")
+                if (b + 1) % 5 == 0 or b == n_batches - 1:
+                    elapsed = time.time() - t_feat
+                    pct = 100.0 * (b + 1) / n_batches
+                    print(f"    Batch {b+1}/{n_batches} ({pct:.0f}%) | Pos: {country_pos:,} | Neg: {country_neg:,} | {elapsed:.0f}s")
         
         del s1_mat_a, s2s3_mat_a_T, A, B_T, len_A, len_B
         del s1_full, s2s3_full, s1_addr, s2s3_addr

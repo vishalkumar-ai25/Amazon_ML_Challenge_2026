@@ -25,7 +25,7 @@ import pandas as pd
 from collections import Counter
 from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
 from scipy import sparse
-from difflib import SequenceMatcher
+import rapidfuzz
 
 try:
     import lightgbm as lgb
@@ -158,7 +158,7 @@ def compute_pairwise_features(s1_name, s1_addr, s2_name, s2_addr, tfidf_score):
     name2 = normalize_name_deep(s2_name)
     
     features['name_exact'] = 1.0 if name1 == name2 and name1 != '' else 0.0
-    features['name_seqmatch'] = SequenceMatcher(None, name1, name2).ratio() if name1 and name2 else 0.0
+    features['name_seqmatch'] = rapidfuzz.fuzz.ratio(name1, name2) / 100.0 if name1 and name2 else 0.0
     
     w1 = get_word_set(name1)
     w2 = get_word_set(name2)
@@ -180,7 +180,7 @@ def compute_pairwise_features(s1_name, s1_addr, s2_name, s2_addr, tfidf_score):
     aw1 = get_word_set(addr1)
     aw2 = get_word_set(addr2)
     features['addr_jaccard'] = len(aw1 & aw2) / len(aw1 | aw2) if aw1 and aw2 else 0.0
-    features['addr_seqmatch'] = SequenceMatcher(None, addr1, addr2).ratio() if addr1 and addr2 else 0.0
+    features['addr_seqmatch'] = rapidfuzz.fuzz.ratio(addr1, addr2) / 100.0 if addr1 and addr2 else 0.0
     
     pc1 = extract_postal_code(s1_addr)
     pc2 = extract_postal_code(s2_addr)
@@ -428,7 +428,8 @@ def process_country_lgbm(country, model, threshold):
     
     total_time = time.time() - t_start
     avg_preds = country_preds / n_s1 if n_s1 > 0 else 0
-    print(f"[{country}] Done in {total_time:.1f}s | Matched: {country_matched:,}/{n_s1:,} ({100*country_matched/n_s1:.1f}%) | Preds: {country_preds:,} (avg {avg_preds:.2f}/entity)")
+    avg_per_matched = country_preds / country_matched if country_matched > 0 else 0
+    print(f"[{country}] Done in {total_time:.1f}s | Matched: {country_matched:,}/{n_s1:,} ({100*country_matched/n_s1:.1f}%) | Preds: {country_preds:,} (avg {avg_preds:.2f}/entity, {avg_per_matched:.2f}/non-empty entity)")
     
     del assigned_matches_per_s1, s1_ids, s2s3_ids
     gc.collect()
@@ -519,11 +520,15 @@ def main():
     print(f"{'='*80}")
     total_preds = 0
     total_entities = 0
+    total_matched = 0
     for c, n, m, p in stats:
-        print(f"  {c:8s}: {m:,}/{n:,} matched ({100*m/n:.1f}%) | {p:,} preds ({p/n:.2f}/entity)")
+        avg_m = p / m if m > 0 else 0
+        print(f"  {c:8s}: {m:,}/{n:,} matched ({100*m/n:.1f}%) | {p:,} preds ({p/n:.2f}/entity, {avg_m:.2f}/non-empty)")
         total_preds += p
         total_entities += n
-    print(f"  {'TOTAL':8s}: {total_entities:,} entities | {total_preds:,} predictions ({total_preds/total_entities:.2f}/entity)")
+        total_matched += m
+    total_avg_m = total_preds / total_matched if total_matched > 0 else 0
+    print(f"  {'TOTAL':8s}: {total_entities:,} entities | {total_preds:,} predictions ({total_preds/total_entities:.2f}/entity, {total_avg_m:.2f}/non-empty)")
 
 
 if __name__ == "__main__":

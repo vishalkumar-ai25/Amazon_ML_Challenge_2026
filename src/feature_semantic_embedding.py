@@ -25,8 +25,12 @@ class SemanticEmbedder:
         self,
         model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
         device: Optional[str] = None,
-        batch_size: int = 256
+        batch_size: int = 2048
     ):
+        print("ASSERTING CUDA AVAILABILITY:", torch.cuda.is_available())
+        if not torch.cuda.is_available():
+            print("WARNING: CUDA is NOT available! GPU acceleration will not be used. Expect severe performance degradation.")
+
         if device is None:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
         else:
@@ -72,7 +76,7 @@ def get_embedding_scores(
     candidate_pairs: List[Tuple[str, str]],
     model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
     device: Optional[str] = None,
-    batch_size: int = 256,
+    batch_size: int = 2048,
     weight_name: float = 0.5,
     weight_addr: float = 0.5,
     composite: bool = False

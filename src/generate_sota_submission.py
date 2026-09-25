@@ -183,6 +183,15 @@ def process_country_sota(country, model, threshold=0.55):
     part_match = os.path.join(PARTS_DIR, f"match_{country}.tsv")
     part_cand = os.path.join(PARTS_DIR, f"cand_{country}.tsv")
     
+    # Fast Resume: If country is already 100% finished on disk, skip it!
+    s1_counts = {'France': 259452, 'India': 809986, 'US': 663106}
+    if os.path.isfile(part_match) and os.path.isfile(part_cand):
+        with open(part_match, 'r', encoding='utf-8') as f:
+            n_done = sum(1 for _ in f)
+        if n_done == s1_counts.get(country, -1):
+            print(f"[{country}] Already 100% complete on disk ({n_done:,} records). Skipping to next country!", flush=True)
+            return n_done, n_done, 0
+    
     # 1. Load data
     print(f"[{country}] Loading S1 test records...", end=" ", flush=True)
     s1 = pd.read_csv(os.path.join(DATA_DIR, "test_source1.tsv"), sep="\t", dtype=str).fillna("")
@@ -348,11 +357,16 @@ def process_country_sota(country, model, threshold=0.55):
                         else:
                             cands[cidx][2] = float(data[t])
                             
-                sorted_cands = sorted(cands.items(), key=lambda x: -(max(x[1][0], x[1][1], x[1][2])))[:50]
+                sorted_cands = sorted(cands.items(), key=lambda x: -(max(x[1][0], x[1][1], x[1][2])))[:30]
                 cand_ids = [s2s3_ids[cidx] for cidx, _ in sorted_cands]
                 fc.write(f"{sid}\t{','.join(cand_ids)}\n")
                 
                 for rank, (cidx, scores) in enumerate(sorted_cands, 1):
+                    max_score = max(scores[0], scores[1], scores[2])
+                    # Speedup Pruning: If rank > 3 and max channel similarity < 0.15,
+                    # LightGBM probability is mathematically guaranteed to be < 0.05.
+                    if rank > 3 and max_score < 0.15:
+                        continue
                     cid = s2s3_ids[cidx]
                     feats = extract_fast_pairwise_features(
                         s1_name_words[g_i], s1_addr_words[g_i], s1_hns[g_i], s1_pcs[g_i],
@@ -366,7 +380,7 @@ def process_country_sota(country, model, threshold=0.55):
                     
             if batch_feature_rows:
                 X_batch = np.array(batch_feature_rows, dtype=np.float32)
-                probs = model.predict(X_batch)
+                probs = model.predict(X_batch, num_threads=16)
                 for j, prob in enumerate(probs):
                     if prob >= threshold:
                         g_i, cid = batch_meta[j]

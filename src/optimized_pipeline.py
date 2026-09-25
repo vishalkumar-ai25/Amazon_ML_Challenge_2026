@@ -508,22 +508,63 @@ def run_benchmark():
     # ── Stage 7: Evaluate Threshold Sweep + Global M2O ──────────
     print("\n[Stage 7] Evaluating Full Pipeline with Global Many-to-One (M2O) Resolution...")
     
+    # 1. Country-specific sweeps
+    s1_country_map = dict(zip(s1_samp['entity_id'], s1_samp['country']))
+    per_country_results = {}
+    
+    for country in ['US', 'India']:
+        print(f"\n--- Threshold Calibration Sweep: {country} ---")
+        c_sids = set(s1_samp[s1_samp['country'] == country]['entity_id'])
+        c_gt = {sid: gt_dict[sid] for sid in c_sids}
+        c_sample_ids = [sid for sid in sample_ids if sid in c_sids]
+        
+        c_pair_indices = [idx for idx, (sid, cid) in enumerate(triples) if sid in c_sids]
+        c_pair_indices = np.array(c_pair_indices, dtype=np.int32)
+        c_preds = oof_preds[c_pair_indices]
+        
+        best_c_tau = 0.50
+        best_c_f05 = 0.0
+        
+        for tau in np.arange(0.20, 0.90, 0.025):
+            mask = c_preds >= tau
+            passed_sub_idx = np.where(mask)[0]
+            passed_indices = c_pair_indices[passed_sub_idx]
+            
+            sort_order = np.argsort(-oof_preds[passed_indices])
+            sorted_idx = passed_indices[sort_order]
+            
+            assigned_cids = set()
+            pred_dict = {sid: set() for sid in c_sample_ids}
+            total_p = 0
+            for idx in sorted_idx:
+                sid, cid = triples[idx]
+                if cid not in assigned_cids:
+                    assigned_cids.add(cid)
+                    pred_dict[sid].add(cid)
+                    total_p += 1
+            f05 = compute_f05_macro(c_gt, pred_dict, c_sample_ids)
+            avg_p = total_p / len(c_sample_ids)
+            marker = " ★ BEST" if f05 > best_c_f05 else ""
+            if f05 > best_c_f05:
+                best_c_f05 = f05
+                best_c_tau = tau
+            print(f"  [{country}] τ = {tau:.3f} | Macro F₀.₅ = {f05:.4f} | Avg preds = {avg_p:.2f}{marker}")
+            
+        print(f"  --> {country} Best τ = {best_c_tau:.3f} (Macro F₀.₅ = {best_c_f05:.4f})")
+        per_country_results[country] = {'best_tau': float(best_c_tau), 'best_f05': float(best_c_f05)}
+
+    # 2. Pooled sweep
+    print("\n--- Pooled Threshold Calibration Sweep (US + India) ---")
     best_tau = 0.50
     best_f05 = 0.0
-    
     for tau in np.arange(0.20, 0.90, 0.05):
-        # Filter triples where oof_pred >= tau
         mask = oof_preds >= tau
         cand_indices = np.where(mask)[0]
-        
-        # Sort globally by predicted probability
         sorted_cand_idx = cand_indices[np.argsort(-oof_preds[cand_indices])]
         
-        # Greedy M2O
         assigned_cids = set()
         pred_dict = {sid: set() for sid in sample_ids}
         total_p = 0
-        
         for idx in sorted_cand_idx:
             sid, cid = triples[idx]
             if cid not in assigned_cids:
@@ -537,12 +578,28 @@ def run_benchmark():
         if f05 > best_f05:
             best_f05 = f05
             best_tau = tau
-        print(f"  τ = {tau:.2f} | Macro F₀.₅ = {f05:.4f} | Avg preds/entity = {avg_preds:.2f}{marker}")
+        print(f"  Pooled τ = {tau:.2f} | Macro F₀.₅ = {f05:.4f} | Avg preds/entity = {avg_preds:.2f}{marker}")
         
     print("\n" + "=" * 80)
     print(f"  OPTIMIZED PIPELINE VALIDATION RESULT: Macro F₀.₅ = {best_f05:.4f} at τ = {best_tau:.2f}")
-    print(f"  Compare to baseline: 0.624 -> {best_f05:.4f} (+{best_f05 - 0.624:.4f} gain!)")
+    print(f"  Per-country: US τ = {per_country_results['US']['best_tau']:.3f} | India τ = {per_country_results['India']['best_tau']:.3f}")
     print("=" * 80)
+    
+    # Persist calibration to models/threshold_calibration.json
+    import json
+    os.makedirs("models", exist_ok=True)
+    calib_payload = {
+        'best_tau_pooled': float(best_tau),
+        'best_f05_pooled': float(best_f05),
+        'per_country': {
+            'US': per_country_results['US'],
+            'India': per_country_results['India'],
+            'France': {'best_tau': 0.60, 'status': 'unvalidated_conservative_default'}
+        }
+    }
+    with open("models/threshold_calibration.json", "w") as f:
+        json.dump(calib_payload, f, indent=2)
+    print("Persisted calibrated thresholds to models/threshold_calibration.json")
     
     # Save the trained model for production inference
     os.makedirs("models", exist_ok=True)
