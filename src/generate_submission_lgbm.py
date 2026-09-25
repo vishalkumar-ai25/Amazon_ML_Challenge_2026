@@ -208,6 +208,29 @@ def process_country_lgbm(country, model, threshold):
     part_match = os.path.join(PARTS_DIR, f"match_{country}.tsv")
     part_cand = os.path.join(PARTS_DIR, f"cand_{country}.tsv")
     
+    if os.path.isfile(part_match) and os.path.isfile(part_cand):
+        s1_count_df = pd.read_csv(os.path.join(DATA_DIR, "test_source1.tsv"), sep="\t", usecols=['country'])
+        expected_n = int((s1_count_df['country'] == country).sum())
+        del s1_count_df
+        
+        country_matched = 0
+        country_preds = 0
+        n_lines = 0
+        with open(part_match, "r", encoding="utf-8") as fm:
+            for line in fm:
+                n_lines += 1
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) >= 2 and parts[1].strip():
+                    country_matched += 1
+                    country_preds += len(parts[1].split(","))
+        
+        if n_lines == expected_n:
+            avg_preds = country_preds / n_lines if n_lines > 0 else 0
+            avg_per_matched = country_preds / country_matched if country_matched > 0 else 0
+            print(f"[{country}] Checkpoint found! Skipping recomputation ({n_lines:,} entities).")
+            print(f"[{country}] Matched: {country_matched:,}/{n_lines:,} ({100*country_matched/n_lines:.1f}%) | Preds: {country_preds:,} (avg {avg_preds:.2f}/entity, {avg_per_matched:.2f}/non-empty entity)")
+            return n_lines, country_matched, country_preds
+    
     # 1. Load data
     print(f"[{country}] Loading test data...", end=" ", flush=True)
     s1 = pd.read_csv(os.path.join(DATA_DIR, "test_source1.tsv"), sep="\t", dtype=str).fillna("")

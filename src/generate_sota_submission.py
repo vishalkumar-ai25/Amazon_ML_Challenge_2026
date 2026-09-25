@@ -266,17 +266,18 @@ def process_country_multi_channel(country):
     c_ids = s2s3_c['entity_id'].values
     print(f"[{country}] Preprocessing completed in {time.time()-t0:.1f}s")
     
-    # 4. Inverted Indexes
-    print(f"[{country}] Building Inverted Premise and Prefix Indexes...", flush=True)
-    hn_index = defaultdict(list)
-    prefix_index = defaultdict(list)
+    # 4. Inverted Premise Index (Tight (city, hn) clusters with <= 10 records)
+    print(f"[{country}] Building Tight Inverted Premise Index...", flush=True)
+    t0 = time.time()
+    tight_premise_index = defaultdict(list)
     for j in range(n_s2s3):
-        hn, _, _, _, _ = c_addrs[j]
-        if hn:
-            hn_index[hn].append(j)
-        p = c_cn[j][:4]
-        if len(p) >= 3:
-            prefix_index[p].append(j)
+        hn, _, city, _, _ = c_addrs[j]
+        if hn and city and len(city) >= 3:
+            tight_premise_index[(city, hn)].append(j)
+            
+    # Filter out generic buckets (> 10 records) to avoid candidate explosion
+    tight_premise_index = {k: v for k, v in tight_premise_index.items() if len(v) <= 10}
+    print(f"[{country}] Premise index built: {len(tight_premise_index):,} tight clusters in {time.time()-t0:.1f}s", flush=True)
             
     # 5. TF-IDF Matrix Vectorization
     print(f"[{country}] Fitting TF-IDF Vectorizer...", flush=True)
@@ -332,20 +333,23 @@ def process_country_multi_channel(country):
             if p0 < p1:
                 data = sims.data[p0:p1]
                 indices = sims.indices[p0:p1]
-                k = min(30, len(data))
+                k = min(35, len(data))
                 top_k = np.argpartition(data, -k)[-k:]
                 for t in top_k:
                     cidx = indices[t]
                     cand_indices.add(cidx)
                     tfidf_dict[cidx] = float(data[t])
                     
-            if s1_hn:
-                for cidx in hn_index.get(s1_hn, []):
+            if s1_hn and s1_city and (s1_city, s1_hn) in tight_premise_index:
+                for cidx in tight_premise_index[(s1_city, s1_hn)]:
                     cand_indices.add(cidx)
-            p = s1_name_clean[:4]
-            if len(p) >= 3:
-                for cidx in prefix_index.get(p, []):
-                    cand_indices.add(cidx)
+                    
+            # HARD CAP: strictly at most 40 candidates per query to prevent memory/time blowup
+            if len(cand_indices) > 40:
+                sorted_cands = sorted(cand_indices, key=lambda cidx: tfidf_dict.get(cidx, 0.0), reverse=True)
+                cand_indices = sorted_cands[:40]
+            else:
+                cand_indices = list(cand_indices)
                     
             cand_list = [c_ids[cidx] for cidx in cand_indices]
             if cand_list:
@@ -429,7 +433,7 @@ def process_country_multi_channel(country):
         pct = 100.0 * (b + 1) / n_batches
         eta = (elapsed / (b + 1)) * (n_batches - b - 1)
         if (b + 1) % 3 == 0 or b == n_batches - 1:
-            print(f"  [{country}] Batch {b+1}/{n_batches} ({pct:.0f}%) | Elapsed: {elapsed:.0f}s | ETA: {eta:.0f}s")
+            print(f"  [{country}] Batch {b+1}/{n_batches} ({pct:.0f}%) | Elapsed: {elapsed:.0f}s | ETA: {eta:.0f}s", flush=True)
             
     candidate_file.close()
     del s1_mat, c_mat, c_mat_T
