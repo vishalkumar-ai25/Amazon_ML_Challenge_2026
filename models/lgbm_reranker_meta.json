@@ -1,0 +1,103 @@
+{
+  "feature_names": [
+    "tfidf_composite",
+    "name_exact",
+    "name_seqmatch",
+    "name_jaccard",
+    "name_containment",
+    "name_len_ratio",
+    "name_word_diff",
+    "name_first_word_match",
+    "script_mismatch",
+    "addr_exact",
+    "addr_jaccard",
+    "addr_seqmatch",
+    "postal_match",
+    "house_num_match",
+    "both_addr_missing",
+    "one_addr_missing",
+    "name_in_addr_overlap",
+    "addr_containment"
+  ],
+  "fold_metrics": [
+    {
+      "fold": 1,
+      "f05": 0.8934137554143221,
+      "precision": 0.9147554573086488,
+      "recall": 0.8171551990126504,
+      "best_threshold": 0.6249999999999999,
+      "tp": 13242,
+      "fp": 1234,
+      "fn": 2963,
+      "n_trees": 763
+    },
+    {
+      "fold": 2,
+      "f05": 0.8931047523005168,
+      "precision": 0.9242643861429193,
+      "recall": 0.7869793273680963,
+      "best_threshold": 0.6749999999999998,
+      "tp": 12753,
+      "fp": 1045,
+      "fn": 3452,
+      "n_trees": 686
+    },
+    {
+      "fold": 3,
+      "f05": 0.8991579093882662,
+      "precision": 0.9288281811646297,
+      "recall": 0.7972847886454798,
+      "best_threshold": 0.6749999999999998,
+      "tp": 12920,
+      "fp": 990,
+      "fn": 3285,
+      "n_trees": 786
+    },
+    {
+      "fold": 4,
+      "f05": 0.8983484596344516,
+      "precision": 0.9292637060610444,
+      "recall": 0.7928417155199012,
+      "best_threshold": 0.6749999999999998,
+      "tp": 12848,
+      "fp": 978,
+      "fn": 3357,
+      "n_trees": 720
+    },
+    {
+      "fold": 5,
+      "f05": 0.8947164893083741,
+      "precision": 0.9321098179647866,
+      "recall": 0.7709966059858069,
+      "best_threshold": 0.6999999999999998,
+      "tp": 12494,
+      "fp": 910,
+      "fn": 3711,
+      "n_trees": 885
+    }
+  ],
+  "avg_f05": 0.8957482732091862,
+  "avg_precision": 0.9258443097284058,
+  "avg_recall": 0.793051527306387,
+  "best_threshold": 0.6699999999999998,
+  "params": {
+    "objective": "binary",
+    "metric": [
+      "binary_logloss",
+      "auc"
+    ],
+    "learning_rate": 0.05,
+    "num_leaves": 63,
+    "max_depth": 7,
+    "min_child_samples": 50,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "reg_alpha": 0.1,
+    "reg_lambda": 1.0,
+    "scale_pos_weight": 0.851280468991052,
+    "verbose": -1,
+    "random_state": 42,
+    "n_jobs": -1
+  },
+  "sample_size_per_country": 15000
+}
