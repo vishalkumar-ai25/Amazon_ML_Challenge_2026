@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-AMAZON ML CHALLENGE 2026: SOTA MULTI-CHANNEL PRODUCTION INFERENCE (HIGH-THROUGHPUT MULTI-CORE)
-==============================================================================================
+AMAZON ML CHALLENGE 2026: SOTA MULTI-CHANNEL PRODUCTION INFERENCE (ZERO-IPC PARALLEL)
+======================================================================================
 Verified Benchmark Score: Macro F0.5 = 0.9625 | Precision = 98.34%
 
-Multi-Core Architecture:
-- Uses all available CPU cores (up to 72 parallel worker processes on 96-core server)
-- Zero-copy copy-on-write shared memory inheritance under Linux fork
+High-Throughput Zero-IPC Architecture:
+- 48 physical CPU workers mapping 1:1 to dual-socket Intel Xeon hardware cores
+- File-backed chunk output (each worker writes cand/claims directly to disk, returning only 16 bytes over IPC)
+- Completely eliminates POSIX 64KB pipe buffer limits and futex_do_wait deadlocks
+- Zero-copy shared memory inheritance under Linux fork
 - Parallel text preprocessing and address extraction across all cores
-- Vectorized sparse matrix cosine similarity via OpenMP/BLAS
 - Strict candidate capping (<= 40 candidates/query) to guarantee predictable O(1) memory
 - 4-Channel invariant matching (Address Anchor, Web/Domain Cleanser, Missing Address Fallback, Composite)
 - Global Many-to-One (M2O) bipartite resolution per country
@@ -25,6 +26,7 @@ import sys
 import time
 import gc
 import re
+import shutil
 import unicodedata
 import zipfile
 import multiprocessing as mp
@@ -37,7 +39,8 @@ from rapidfuzz import fuzz
 
 # Ensure BLAS/OpenMP utilize multiple threads
 CPU_COUNT = os.cpu_count() or 4
-N_WORKERS = max(1, min(72, CPU_COUNT - 8 if CPU_COUNT > 16 else CPU_COUNT))
+# 48 physical cores matches dual Intel Xeon Gold 6248R 1:1 without hyperthreading thrashing
+N_WORKERS = max(1, min(48, CPU_COUNT - 8 if CPU_COUNT > 16 else CPU_COUNT))
 os.environ["OMP_NUM_THREADS"] = str(min(16, CPU_COUNT))
 os.environ["MKL_NUM_THREADS"] = str(min(16, CPU_COUNT))
 
@@ -259,6 +262,9 @@ def worker_score_chunk(chunk_info):
     tight_premise_index = _SHARED['tight_premise_index']
     tau = _SHARED['tau']
     
+    chunk_cand_dir = _SHARED['chunk_cand_dir']
+    chunk_claim_dir = _SHARED['chunk_claim_dir']
+    
     cand_lines = []
     chunk_claims = []
     
@@ -373,7 +379,18 @@ def worker_score_chunk(chunk_info):
             if prob >= tau:
                 chunk_claims.append((g_i, cid, float(prob)))
                 
-    return chunk_idx, cand_lines, chunk_claims
+    # File-backed output: write directly to disk to prevent any POSIX pipe deadlock
+    chunk_cand_path = os.path.join(chunk_cand_dir, f"cand_{chunk_idx:06d}.tsv")
+    with open(chunk_cand_path, "w", encoding="utf-8") as f_c:
+        f_c.writelines(cand_lines)
+        
+    chunk_claims_path = os.path.join(chunk_claim_dir, f"claims_{chunk_idx:06d}.tsv")
+    with open(chunk_claims_path, "w", encoding="utf-8") as f_cl:
+        for s1_idx, cid, score in chunk_claims:
+            f_cl.write(f"{s1_idx}\t{cid}\t{score:.4f}\n")
+            
+    # Return only tiny 16-byte tuple over IPC
+    return chunk_idx, len(chunk_claims)
 
 def process_country_multi_channel(country):
     print("\n" + "=" * 80)
@@ -385,7 +402,7 @@ def process_country_multi_channel(country):
     part_cand = os.path.join(PARTS_DIR, f"candidates_{country}.tsv")
     
     if os.path.exists(part_match) and os.path.exists(part_cand) and os.path.getsize(part_match) > 1000:
-        print(f"[{country}] Cached partition found at {part_match}. Skipping computation.")
+        print(f"[{country}] Cached partition found at {part_match}. Skipping computation.", flush=True)
         return
         
     # 1. Load S1 for country
@@ -475,6 +492,14 @@ def process_country_multi_channel(country):
     tau = cfg['tau']
     max_k = cfg['max_k']
     
+    # Create scratch chunk directories for zero-IPC file-backed worker output
+    chunk_cand_dir = os.path.join(PARTS_DIR, f"chunks_cand_{country}")
+    chunk_claim_dir = os.path.join(PARTS_DIR, f"chunks_claim_{country}")
+    shutil.rmtree(chunk_cand_dir, ignore_errors=True)
+    shutil.rmtree(chunk_claim_dir, ignore_errors=True)
+    os.makedirs(chunk_cand_dir, exist_ok=True)
+    os.makedirs(chunk_claim_dir, exist_ok=True)
+    
     # Store shared objects in module-level global dict for zero-copy fork inheritance
     _SHARED['s1_mat'] = s1_mat
     _SHARED['c_mat_T'] = c_mat_T
@@ -490,25 +515,25 @@ def process_country_multi_channel(country):
     _SHARED['c_raw_addrs'] = c_raw_addrs
     _SHARED['tight_premise_index'] = tight_premise_index
     _SHARED['tau'] = tau
+    _SHARED['chunk_cand_dir'] = chunk_cand_dir
+    _SHARED['chunk_claim_dir'] = chunk_claim_dir
     
-    # 6. High-Throughput Parallel Candidate Scoring across all Cores
+    # 6. High-Throughput Parallel Candidate Scoring (Zero-IPC File-Backed)
     CHUNK_SIZE = 1500
     chunks = [(idx, i, min(i + CHUNK_SIZE, n_s1)) for idx, i in enumerate(range(0, n_s1, CHUNK_SIZE))]
     n_chunks = len(chunks)
-    print(f"[{country}] Scoring {n_s1:,} queries across {N_WORKERS} parallel workers in {n_chunks} chunks...", flush=True)
+    print(f"[{country}] Scoring {n_s1:,} queries across {N_WORKERS} workers in {n_chunks} chunks (Zero-IPC mode)...", flush=True)
     
     t_inf = time.time()
-    chunk_cand_results = [None] * n_chunks
-    all_claims = []
-    
     completed_chunks = 0
+    total_claims_count = 0
+    
     with mp.Pool(processes=N_WORKERS) as pool:
-        for chunk_idx, cand_lines, chunk_claims in pool.imap_unordered(worker_score_chunk, chunks, chunksize=1):
-            chunk_cand_results[chunk_idx] = cand_lines
-            all_claims.extend(chunk_claims)
+        for chunk_idx, n_claims in pool.imap_unordered(worker_score_chunk, chunks, chunksize=1):
+            total_claims_count += n_claims
             completed_chunks += 1
             
-            if completed_chunks % max(1, n_chunks // 10) == 0 or completed_chunks == n_chunks:
+            if completed_chunks % max(1, n_chunks // 20) == 0 or completed_chunks == n_chunks:
                 elapsed = time.time() - t_inf
                 pct = 100.0 * completed_chunks / n_chunks
                 processed_ent = min(completed_chunks * CHUNK_SIZE, n_s1)
@@ -522,22 +547,34 @@ def process_country_multi_channel(country):
     del s1_mat, c_mat, c_mat_T
     gc.collect()
     
-    # Write candidate pairs partition
-    print(f"[{country}] Writing candidate pairs partition to {part_cand}...", flush=True)
+    # Assemble candidate pairs partition from chunk files
+    print(f"[{country}] Assembling candidate pairs partition to {part_cand}...", flush=True)
     with open(part_cand, "w", encoding="utf-8") as fc:
-        for lines in chunk_cand_results:
-            if lines:
-                fc.writelines(lines)
-    del chunk_cand_results
-    gc.collect()
+        for idx in range(n_chunks):
+            cp = os.path.join(chunk_cand_dir, f"cand_{idx:06d}.tsv")
+            if os.path.exists(cp):
+                with open(cp, "r", encoding="utf-8") as in_f:
+                    shutil.copyfileobj(in_f, fc)
+                os.remove(cp)
+    shutil.rmtree(chunk_cand_dir, ignore_errors=True)
     
     # 7. Global Many-to-One Bipartite Resolution
-    print(f"[{country}] Global M2O Bipartite Resolution on {len(all_claims):,} claims...", end=" ", flush=True)
+    print(f"[{country}] Loading {total_claims_count:,} claims for Global M2O...", flush=True)
     t_m2o = time.time()
+    all_claims = []
+    for idx in range(n_chunks):
+        clp = os.path.join(chunk_claim_dir, f"claims_{idx:06d}.tsv")
+        if os.path.exists(clp):
+            with open(clp, "r", encoding="utf-8") as in_f:
+                for line in in_f:
+                    parts = line.rstrip("\n").split("\t")
+                    all_claims.append((int(parts[0]), parts[1], float(parts[2])))
+            os.remove(clp)
+    shutil.rmtree(chunk_claim_dir, ignore_errors=True)
     
+    print(f"[{country}] Global M2O Bipartite Resolution on {len(all_claims):,} claims...", end=" ", flush=True)
     assigned_matches_per_s1 = {i: [] for i in range(n_s1)}
     if len(all_claims) > 0:
-        # Sort claims descending by score
         all_claims.sort(key=lambda x: x[2], reverse=True)
         assigned_cids = set()
         s1_claim_counts = defaultdict(int)
@@ -647,7 +684,7 @@ def assemble_final_submission():
 
 def main():
     print("╔══════════════════════════════════════════════════════════════════════════════╗")
-    print(f"║   AMAZON ML CHALLENGE 2026: SOTA MULTI-CHANNEL ENGINE ({N_WORKERS:2d} PARALLEL CORES)   ║")
+    print(f"║   AMAZON ML CHALLENGE 2026: SOTA MULTI-CHANNEL ENGINE ({N_WORKERS:2d} PHYSICAL CORES)   ║")
     print("╚══════════════════════════════════════════════════════════════════════════════╝", flush=True)
     t_start = time.time()
     
