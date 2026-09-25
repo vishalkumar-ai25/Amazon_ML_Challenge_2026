@@ -37,10 +37,9 @@ from scipy import sparse
 from sklearn.feature_extraction.text import TfidfVectorizer
 from rapidfuzz import fuzz
 
-# Ensure BLAS/OpenMP utilize multiple threads
 CPU_COUNT = os.cpu_count() or 4
-# 48 physical cores matches dual Intel Xeon Gold 6248R 1:1 without hyperthreading thrashing
-N_WORKERS = max(1, min(48, CPU_COUNT - 8 if CPU_COUNT > 16 else CPU_COUNT))
+# 16 workers ensures peak throughput within 40 GB RAM (leaving 145+ GB free headroom)
+N_WORKERS = max(1, min(16, CPU_COUNT))
 os.environ["OMP_NUM_THREADS"] = str(min(16, CPU_COUNT))
 os.environ["MKL_NUM_THREADS"] = str(min(16, CPU_COUNT))
 
@@ -244,6 +243,19 @@ _SHARED = {}
 def worker_score_chunk(chunk_info):
     chunk_idx, b_start, b_end = chunk_info
     
+    chunk_cand_dir = _SHARED['chunk_cand_dir']
+    chunk_claim_dir = _SHARED['chunk_claim_dir']
+    chunk_cand_path = os.path.join(chunk_cand_dir, f"cand_{chunk_idx:06d}.tsv")
+    chunk_claims_path = os.path.join(chunk_claim_dir, f"claims_{chunk_idx:06d}.tsv")
+    
+    # Instant resume if chunk was already completed on disk
+    if os.path.exists(chunk_cand_path) and os.path.exists(chunk_claims_path) and os.path.getsize(chunk_cand_path) > 0:
+        n_claims = 0
+        with open(chunk_claims_path, "r", encoding="utf-8") as f_cl:
+            for _ in f_cl:
+                n_claims += 1
+        return chunk_idx, n_claims
+        
     s1_mat_chunk = _SHARED['s1_mat'][b_start:b_end]
     c_mat_T = _SHARED['c_mat_T']
     sims = (s1_mat_chunk @ c_mat_T).tocsr()
@@ -261,9 +273,6 @@ def worker_score_chunk(chunk_info):
     c_raw_addrs = _SHARED['c_raw_addrs']
     tight_premise_index = _SHARED['tight_premise_index']
     tau = _SHARED['tau']
-    
-    chunk_cand_dir = _SHARED['chunk_cand_dir']
-    chunk_claim_dir = _SHARED['chunk_claim_dir']
     
     cand_lines = []
     chunk_claims = []
@@ -492,11 +501,9 @@ def process_country_multi_channel(country):
     tau = cfg['tau']
     max_k = cfg['max_k']
     
-    # Create scratch chunk directories for zero-IPC file-backed worker output
+    # Ensure scratch chunk directories exist (keep existing files for instant resume)
     chunk_cand_dir = os.path.join(PARTS_DIR, f"chunks_cand_{country}")
     chunk_claim_dir = os.path.join(PARTS_DIR, f"chunks_claim_{country}")
-    shutil.rmtree(chunk_cand_dir, ignore_errors=True)
-    shutil.rmtree(chunk_claim_dir, ignore_errors=True)
     os.makedirs(chunk_cand_dir, exist_ok=True)
     os.makedirs(chunk_claim_dir, exist_ok=True)
     
